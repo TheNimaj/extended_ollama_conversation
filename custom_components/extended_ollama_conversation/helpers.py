@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
+import ast
 from datetime import timedelta
+import json
 import logging
 import os
 import re
@@ -9,7 +11,7 @@ from typing import Any
 from urllib import parse
 
 from bs4 import BeautifulSoup
-from openai import AsyncAzureOpenAI, AsyncOpenAI
+from ollama import AsyncClient
 import voluptuous as vol
 import yaml
 
@@ -21,6 +23,7 @@ from homeassistant.components import (
     rest,
     scrape,
 )
+
 from homeassistant.components.automation.config import _async_validate_config_item
 from homeassistant.components.script.config import SCRIPT_ENTITY_SCHEMA
 from homeassistant.config import AUTOMATION_CONFIG_PATH
@@ -54,9 +57,6 @@ from .exceptions import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-
-AZURE_DOMAIN_PATTERN = r"\.openai\.azure\.com"
 
 
 def get_function_executor(value: str):
@@ -135,18 +135,7 @@ async def validate_authentication(
     if skip_authentication:
         return
 
-    if is_azure(base_url):
-        client = AsyncAzureOpenAI(
-            api_key=api_key,
-            azure_endpoint=base_url,
-            api_version=api_version,
-            organization=organization,
-        )
-    else:
-        client = AsyncOpenAI(
-            api_key=api_key, base_url=base_url, organization=organization
-        )
-
+    client = AsyncClient(host=base_url)
     await client.models.list(timeout=10)
 
 
@@ -223,6 +212,10 @@ class NativeFunctionExecutor(FunctionExecutor):
             return await self.get_statistics(
                 hass, function, arguments, user_input, exposed_entities
             )
+        if name == "get_user_from_user_id":
+            return await self.get_user_from_user_id(
+                hass, function, arguments, user_input, exposed_entities
+            )
 
         raise NativeNotFound(name)
 
@@ -234,21 +227,18 @@ class NativeFunctionExecutor(FunctionExecutor):
         user_input: conversation.ConversationInput,
         exposed_entities,
     ):
-        domain = service_argument["domain"]
-        service = service_argument["service"]
-        service_data = service_argument.get(
-            "service_data", service_argument.get("data", {})
-        )
-        entity_id = service_data.get("entity_id", service_argument.get("entity_id"))
-        area_id = service_data.get("area_id")
-        device_id = service_data.get("device_id")
+        domain = service_argument["entity_id"].split(".")[0]
+        if "." not in service_argument["service"]:
+            service = service_argument["service"]
+        else:
+            service = service_argument["service"].split(".")[-1]
+        entity_id = service_argument["entity_id"]
 
         if isinstance(entity_id, str):
             entity_id = [e.strip() for e in entity_id.split(",")]
-        service_data["entity_id"] = entity_id
 
-        if entity_id is None and area_id is None and device_id is None:
-            raise CallServiceError(domain, service, service_data)
+        if entity_id is None:
+            raise CallServiceError(domain, service)
         if not hass.services.has_service(domain, service):
             raise ServiceNotFound(domain, service)
         self.validate_entity_ids(hass, entity_id or [], exposed_entities)
@@ -257,7 +247,7 @@ class NativeFunctionExecutor(FunctionExecutor):
             await hass.services.async_call(
                 domain=domain,
                 service=service,
-                service_data=service_data,
+                service_data={"entity_id": entity_id},
             )
             return {"success": True}
         except HomeAssistantError as e:
@@ -273,7 +263,20 @@ class NativeFunctionExecutor(FunctionExecutor):
         exposed_entities,
     ):
         result = []
-        for service_argument in arguments.get("list", []):
+        try:
+            # Attempt to parse the input as a JSON string
+            argumentList = json.loads(arguments.get("list", []))
+        except json.JSONDecodeError:
+            # If JSON parsing fails, fall back to using ast.literal_eval
+            argumentList = ast.literal_eval(arguments.get("list", []))
+
+        for service_argument in argumentList:
+            if "entity_id" not in service_argument or "service" not in service_argument:
+                result.append(
+                    "Missing required keys: 'entity_id' and/or 'service'. Try the function again."
+                )
+                continue
+
             result.append(
                 await self.execute_service_single(
                     hass, function, service_argument, user_input, exposed_entities
@@ -372,6 +375,17 @@ class NativeFunctionExecutor(FunctionExecutor):
         energy_manager: energy.data.EnergyManager = await energy.async_get_manager(hass)
         return energy_manager.data
 
+    async def get_user_from_user_id(
+        self,
+        hass: HomeAssistant,
+        function,
+        arguments,
+        user_input: conversation.ConversationInput,
+        exposed_entities,
+    ):
+        user = await hass.auth.async_get_user(user_input.context.user_id)
+        return {"name": user.name if user and hasattr(user, "name") else "Unknown"}
+
     async def get_statistics(
         self,
         hass: HomeAssistant,
@@ -427,9 +441,9 @@ class ScriptFunctionExecutor(FunctionExecutor):
         script = Script(
             hass,
             function["sequence"],
-            "extended_openai_conversation",
+            "extended_ollama_conversation",
             DOMAIN,
-            running_description="[extended_openai_conversation] function",
+            running_description="[extended_ollama_conversation] function",
             logger=_LOGGER,
         )
 

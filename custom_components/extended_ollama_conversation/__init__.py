@@ -1,17 +1,12 @@
-"""The OpenAI Conversation integration."""
+"""The Ollama Conversation integration."""
+
 from __future__ import annotations
 
 import json
 import logging
 from typing import Literal
 
-from openai import AsyncAzureOpenAI, AsyncOpenAI
-from openai._exceptions import AuthenticationError, OpenAIError
-from openai.types.chat.chat_completion import (
-    ChatCompletion,
-    ChatCompletionMessage,
-    Choice,
-)
+from ollama import AsyncClient, ResponseError
 import yaml
 
 from homeassistant.components import conversation
@@ -71,14 +66,11 @@ from .exceptions import (
     ParseArgumentsFailed,
     TokenLengthExceededError,
 )
-from .helpers import (
-    get_function_executor,
-    is_azure,
-    validate_authentication,
-)
+from .helpers import get_function_executor, is_azure, validate_authentication
 from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
+_LOGGER.setLevel(level=logging.DEBUG)
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -88,13 +80,13 @@ DATA_AGENT = "agent"
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up OpenAI Conversation."""
+    """Set up Ollama Conversation."""
     await async_setup_services(hass, config)
     return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up OpenAI Conversation from a config entry."""
+    """Set up Ollama Conversation from a config entry."""
 
     try:
         await validate_authentication(
@@ -107,13 +99,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 CONF_SKIP_AUTHENTICATION, DEFAULT_SKIP_AUTHENTICATION
             ),
         )
-    except AuthenticationError as err:
-        _LOGGER.error("Invalid API key: %s", err)
-        return False
-    except OpenAIError as err:
+    except ResponseError as err:
         raise ConfigEntryNotReady(err) from err
 
-    agent = OpenAIAgent(hass, entry)
+    agent = OllamaAgent(hass, entry)
 
     data = hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
     data[CONF_API_KEY] = entry.data[CONF_API_KEY]
@@ -124,14 +113,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload OpenAI."""
+    """Unload Ollama."""
     hass.data[DOMAIN].pop(entry.entry_id)
     conversation.async_unset_agent(hass, entry)
     return True
 
 
-class OpenAIAgent(conversation.AbstractConversationAgent):
-    """OpenAI conversation agent."""
+class OllamaAgent(conversation.AbstractConversationAgent):
+    """Ollama conversation agent."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize the agent."""
@@ -139,19 +128,7 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
         self.entry = entry
         self.history: dict[str, list[dict]] = {}
         base_url = entry.data.get(CONF_BASE_URL)
-        if is_azure(base_url):
-            self.client = AsyncAzureOpenAI(
-                api_key=entry.data[CONF_API_KEY],
-                azure_endpoint=base_url,
-                api_version=entry.data.get(CONF_API_VERSION),
-                organization=entry.data.get(CONF_ORGANIZATION),
-            )
-        else:
-            self.client = AsyncOpenAI(
-                api_key=entry.data[CONF_API_KEY],
-                base_url=base_url,
-                organization=entry.data.get(CONF_ORGANIZATION),
-            )
+        self.client = AsyncClient(host=base_url)
 
     @property
     def supported_languages(self) -> list[str] | Literal["*"]:
@@ -186,20 +163,20 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
             messages = [system_message]
         user_message = {"role": "user", "content": user_input.text}
         if self.entry.options.get(CONF_ATTACH_USERNAME, DEFAULT_ATTACH_USERNAME):
-            user = await self.hass.auth.async_get_user(user_input.context.user_id)
-            if user is not None and user.name is not None:
-                user_message[ATTR_NAME] = user.name
+            user = user_input.context.user_id
+            if user is not None:
+                user_message[ATTR_NAME] = user
 
         messages.append(user_message)
 
         try:
             query_response = await self.query(user_input, messages, exposed_entities, 0)
-        except OpenAIError as err:
+        except ResponseError as err:
             _LOGGER.error(err)
             intent_response = intent.IntentResponse(language=user_input.language)
             intent_response.async_set_error(
                 intent.IntentResponseErrorCode.UNKNOWN,
-                f"Sorry, I had a problem talking to OpenAI: {err}",
+                f"Sorry, I had a problem talking to Ollama: {err}",
             )
             return conversation.ConversationResult(
                 response=intent_response, conversation_id=conversation_id
@@ -215,20 +192,20 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
                 response=intent_response, conversation_id=conversation_id
             )
 
-        messages.append(query_response.message.model_dump(exclude_none=True))
+        messages.append(query_response.message)
         self.history[conversation_id] = messages
 
         self.hass.bus.async_fire(
             EVENT_CONVERSATION_FINISHED,
             {
-                "response": query_response.response.model_dump(),
+                "response": query_response.response,
                 "user_input": user_input,
                 "messages": messages,
             },
         )
 
         intent_response = intent.IntentResponse(language=user_input.language)
-        intent_response.async_set_speech(query_response.message.content)
+        intent_response.async_set_speech(query_response.message["content"])
         return conversation.ConversationResult(
             response=intent_response, conversation_id=conversation_id
         )
@@ -294,6 +271,7 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
                     setting["function"] = function_executor.to_arguments(
                         setting["function"]
                     )
+            _LOGGER.debug("Function Parse Result %s", result)
             return result
         except (InvalidFunction, FunctionNotFound) as e:
             raise e
@@ -328,7 +306,7 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
         messages,
         exposed_entities,
         n_requests,
-    ) -> OpenAIQueryResponse:
+    ) -> OllamaQueryResponse:
         """Process a sentence."""
         model = self.entry.options.get(CONF_CHAT_MODEL, DEFAULT_CHAT_MODEL)
         max_tokens = self.entry.options.get(CONF_MAX_TOKENS, DEFAULT_MAX_TOKENS)
@@ -352,51 +330,43 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
                 "tools": [{"type": "function", "function": func} for func in functions],
                 "tool_choice": function_call,
             }
-
+            _LOGGER.info("Available Tools: %s", json.dumps(tool_kwargs))
         if len(functions) == 0:
             tool_kwargs = {}
 
-        _LOGGER.info("Prompt for %s: %s", model, messages)
+        _LOGGER.info("Prompt for %s: %s", model, json.dumps(messages))
 
-        response: ChatCompletion = await self.client.chat.completions.create(
+        response = await self.client.chat(
             model=model,
             messages=messages,
-            max_tokens=max_tokens,
-            top_p=top_p,
-            temperature=temperature,
-            user=user_input.conversation_id,
-            **tool_kwargs,
+            tools=tool_kwargs.get("tools"),
         )
 
-        _LOGGER.info("Response %s", response.model_dump(exclude_none=True))
+        _LOGGER.info("Response %s", response)
 
-        if response.usage.total_tokens > context_threshold:
-            await self.truncate_message_history(messages, exposed_entities, user_input)
+        message = response.get("message")
 
-        choice: Choice = response.choices[0]
-        message = choice.message
-
-        if choice.finish_reason == "function_call":
-            return await self.execute_function_call(
-                user_input, messages, message, exposed_entities, n_requests + 1
-            )
-        if choice.finish_reason == "tool_calls":
+        # if choice.finish_reason == "function_call":
+        #     return await self.execute_function_call(
+        #         user_input, messages, message, exposed_entities, n_requests + 1
+        #     )
+        if message.get("tool_calls"):
             return await self.execute_tool_calls(
                 user_input, messages, message, exposed_entities, n_requests + 1
             )
-        if choice.finish_reason == "length":
-            raise TokenLengthExceededError(response.usage.completion_tokens)
+        # if choice.finish_reason == "length":
+        #     raise TokenLengthExceededError(response.usage.completion_tokens)
 
-        return OpenAIQueryResponse(response=response, message=message)
+        return OllamaQueryResponse(response=response, message=message)
 
     async def execute_function_call(
         self,
         user_input: conversation.ConversationInput,
         messages,
-        message: ChatCompletionMessage,
+        message,
         exposed_entities,
         n_requests,
-    ) -> OpenAIQueryResponse:
+    ) -> OllamaQueryResponse:
         function_name = message.function_call.name
         function = next(
             (s for s in self.get_functions() if s["spec"]["name"] == function_name),
@@ -417,15 +387,16 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
         self,
         user_input: conversation.ConversationInput,
         messages,
-        message: ChatCompletionMessage,
+        message,
         exposed_entities,
         n_requests,
         function,
-    ) -> OpenAIQueryResponse:
+    ) -> OllamaQueryResponse:
         function_executor = get_function_executor(function["function"]["type"])
 
         try:
             arguments = json.loads(message.function_call.arguments)
+
         except json.decoder.JSONDecodeError as err:
             raise ParseArgumentsFailed(message.function_call.arguments) from err
 
@@ -446,13 +417,13 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
         self,
         user_input: conversation.ConversationInput,
         messages,
-        message: ChatCompletionMessage,
+        message,
         exposed_entities,
         n_requests,
-    ) -> OpenAIQueryResponse:
-        messages.append(message.model_dump(exclude_none=True))
-        for tool in message.tool_calls:
-            function_name = tool.function.name
+    ) -> OllamaQueryResponse:
+        messages.append(message)
+        for tool in message["tool_calls"]:
+            function_name = tool["function"]["name"]
             function = next(
                 (s for s in self.get_functions() if s["spec"]["name"] == function_name),
                 None,
@@ -467,7 +438,7 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
 
                 messages.append(
                     {
-                        "tool_call_id": tool.id,
+                        # "tool_call_id": tool.id,
                         "role": "tool",
                         "name": function_name,
                         "content": str(result),
@@ -483,13 +454,14 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
         tool,
         exposed_entities,
         function,
-    ) -> OpenAIQueryResponse:
+    ) -> OllamaQueryResponse:
         function_executor = get_function_executor(function["function"]["type"])
 
         try:
-            arguments = json.loads(tool.function.arguments)
+            arguments = tool["function"]["arguments"]
+            _LOGGER.debug("Got Arguments: %s", arguments)
         except json.decoder.JSONDecodeError as err:
-            raise ParseArgumentsFailed(tool.function.arguments) from err
+            raise ParseArgumentsFailed(tool["function"]["arguments"]) from err
 
         result = await function_executor.execute(
             self.hass, function["function"], arguments, user_input, exposed_entities
@@ -497,12 +469,10 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
         return result
 
 
-class OpenAIQueryResponse:
-    """OpenAI query response value object."""
+class OllamaQueryResponse:
+    """Ollama query response value object."""
 
-    def __init__(
-        self, response: ChatCompletion, message: ChatCompletionMessage
-    ) -> None:
-        """Initialize OpenAI query response value object."""
+    def __init__(self, response, message) -> None:
+        """Initialize Ollama query response value object."""
         self.response = response
         self.message = message
