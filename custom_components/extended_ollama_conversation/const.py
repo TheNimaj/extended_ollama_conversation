@@ -27,9 +27,10 @@ entity_id,name,state,aliases
 ```
 
 The current state of devices is provided in available devices.
-Use execute_services function only for requested action, not for current states.
-Do not execute service without user's confirmation.
-Do not restate or appreciate what user says, rather make a quick inquiry.
+Use execute_services function to control devices.
+You can infer the entity_id from the name and common variations.
+Do not as for confirmation to execute a service.
+Do not restate or appreciate what user says, rather make a quick inquiry."
 """
 CONF_CHAT_MODEL = "chat_model"
 DEFAULT_CHAT_MODEL = "llama3.1"
@@ -55,27 +56,16 @@ DEFAULT_CONF_FUNCTIONS = [
                         "items": {
                             "type": "object",
                             "properties": {
-                                "domain": {
-                                    "type": "string",
-                                    "description": "The domain of the service",
-                                },
                                 "service": {
                                     "type": "string",
                                     "description": "The service to be called",
                                 },
-                                "service_data": {
-                                    "type": "object",
-                                    "description": "The service data object to indicate what to control.",
-                                    "properties": {
-                                        "entity_id": {
-                                            "type": "string",
-                                            "description": "The entity_id retrieved from available devices. It must start with domain, followed by dot character.",
-                                        }
-                                    },
-                                    "required": ["entity_id"],
+                                 "entity_id": {
+                                    "type": "string",
+                                    "description": "The entity_id retrieved from available devices. It must start with domain, followed by dot character.",
+                                    }
                                 },
-                            },
-                            "required": ["domain", "service", "service_data"],
+                            "required": ["entity_id", "service"],
                         },
                     }
                 },
