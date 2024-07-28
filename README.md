@@ -11,9 +11,9 @@ Derived from [OpenAI Conversation](https://www.home-assistant.io/integrations/op
 - Option to pass the current user's name to OpenAI via the user message context
 
 ## How it works
-Extended OpenAI Conversation uses OpenAI API's feature of [function calling](https://platform.openai.com/docs/guides/function-calling) to call service of Home Assistant.
+Extended Ollama Conversation uses OpenAPI's feature of [function calling](https://platform.openai.com/docs/guides/function-calling) to call service of Home Assistant.
 
-Since "gpt-3.5-turbo" model already knows how to call service of Home Assistant in general, you just have to let model know what devices you have by [exposing entities](https://github.com/jekalmin/extended_openai_conversation#preparation)
+Since "llama3.1" model already knows how to call service of Home Assistant in general, you just have to let model know what devices you have by [exposing entities](https://github.com/jekalmin/extended_openai_conversation#preparation)
 
 ## Installation
 1. Install via registering as a custom repository of HACS or by copying `extended_openai_conversation` folder into `<config directory>/custom_components`
